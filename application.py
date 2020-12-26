@@ -1,10 +1,14 @@
+from datetime import datetime
 import os
 import sqlite3
 
-from flask import Flask, flash, jsonify, redirect, render_template, request, session, g
+
+from flask import (
+    Flask, flash, jsonify, redirect, render_template, request, session, g)
 from flask_session import Session
 from tempfile import mkdtemp
-from werkzeug.exceptions import default_exceptions, HTTPException, InternalServerError
+from werkzeug.exceptions import (
+    default_exceptions, HTTPException, InternalServerError)
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from helpers import apology, login_required, lookup, usd
@@ -29,7 +33,7 @@ def after_request(response):
 app.jinja_env.filters["usd"] = usd
 
 # Configure session to use filesystem (instead of signed cookies)
-app.config["SESSION_FILE_DIR"] = mkdtemp()
+# app.config["SESSION_FILE_DIR"] = mkdtemp()
 app.config["SESSION_PERMANENT"] = False
 app.config["SESSION_TYPE"] = "filesystem"
 Session(app)
@@ -54,9 +58,6 @@ def close_connection(exception):
         db.close()
 
 
-db = get_db()
-
-
 # Make sure API key is set
 if not os.environ.get("API_KEY"):
     raise RuntimeError("API_KEY not set")
@@ -66,14 +67,83 @@ if not os.environ.get("API_KEY"):
 @login_required
 def index():
     """Show portfolio of stocks"""
-    return apology("TODO")
+    db = get_db()
+    owned_shares = db.execute(
+        "SELECT symbol, shares FROM shares WHERE user_id = ?",
+        [session["user_id"]]).fetchall()
+    cash = db.execute("SELECT cash FROM users WHERE id = ?",
+                      [session["user_id"]]).fetchone()["cash"]
+    assets = cash
+    shares = []
+    for share in owned_shares:
+        stockinfo = lookup(share["symbol"])
+        assert stockinfo
+        share = {**stockinfo, **share}
+        share["total"] = stockinfo["price"] * share["shares"]
+        assets += share["total"]
+        share["price"] = usd(share["price"])
+        share["total"] = usd(share["total"])
+        shares.append(share)
+    return render_template(
+        "index.html", shares=shares, cash=usd(cash), assets=usd(assets))
 
 
 @app.route("/buy", methods=["GET", "POST"])
 @login_required
 def buy():
     """Buy shares of stock"""
-    return apology("TODO")
+    if request.method == "GET":
+        return render_template("buy.html")
+
+    symbol = request.form.get("symbol")
+    shares = request.form.get("shares", type=int)
+    # Values check
+    if not all([symbol, shares]):
+        return apology("Fill in all input fields")
+    if shares < 0:
+        return apology("Shares must be a positive number")
+    symbol = symbol.upper()
+    stock = lookup(symbol)
+    if not stock:
+        return apology("Invalid symbol")
+    cost = stock["price"] * shares
+    user_id = session["user_id"]
+    db = get_db()
+    user = db.execute("SELECT cash FROM users WHERE id = ?",
+                      [user_id]).fetchone()
+    cash = user['cash']
+    if cash < cost:
+        return apology("Unsufficient funds")
+
+    cash_left = cash - cost
+
+    # Take money from user account
+    db.execute("UPDATE users SET cash = :cash WHERE id = :user_id",
+               dict(cash=cash_left, user_id=user_id))
+
+    # Find matching share
+    share = db.execute(
+        "SELECT * FROM shares WHERE user_id = :user_id AND symbol = :symbol",
+        dict(user_id=user_id, symbol=symbol)).fetchone()
+    # If user have no related shares then add new row
+    if not share:
+        db.execute("INSERT INTO shares VALUES (?, ?, ?)",
+                   [user_id, symbol, shares])
+    # If user owns company shares update their amount
+    else:
+        total_shares = share["shares"] + shares
+        db.execute(
+            "UPDATE shares SET shares = :shares\
+                WHERE user_id = :user_id AND symbol = :symbol",
+            dict(shares=total_shares, user_id=user_id, symbol=symbol))
+    # Add transaction info
+    db.execute(
+        "INSERT INTO transactions (user_id, symbol, shares, price, timestamp)\
+            VALUES (?, ?, ?, ?, ?)",
+        [user_id, symbol, shares, stock["price"], datetime.now()])
+    db.commit()
+    flash("Your purchase was successful.")
+    return redirect("/")
 
 
 @app.route("/history")
@@ -102,17 +172,20 @@ def login():
             return apology("must provide password", 403)
 
         # Query database for username
+        db = get_db()
         rows = db.execute(
             "SELECT * FROM users WHERE username = :username",
-            username=request.form.get("username"))
+            dict(username=request.form.get("username"))).fetchall()
 
         # Ensure username exists and password is correct
-        if len(rows) != 1 or not check_password_hash(rows[0]["hash"], request.form.get("password")):
+        if len(rows) != 1 or not check_password_hash(
+                rows[0]["hash"], request.form.get("password")):
             return apology("invalid username and/or password", 403)
 
         # Remember which user has logged in
         session["user_id"] = rows[0]["id"]
-
+        session["username"] = rows[0]["username"]
+        flash("You were successfully logged in.")
         # Redirect user to home page
         return redirect("/")
 
@@ -136,20 +209,60 @@ def logout():
 @login_required
 def quote():
     """Get stock quote."""
-    return apology("TODO")
+    if request.method == "GET":
+        return render_template("quote.html")
+    symbol = request.form.get("symbol")
+    if not symbol:
+        return apology("Fill in symbol field")
+    stock = lookup(symbol)
+    if not stock:
+        return apology("Invalid symbol")
+    stock["price"] = usd(stock["price"])
+    return render_template("quote.html", stock=stock)
 
 
 @app.route("/register", methods=["GET", "POST"])
 def register():
     """Register user"""
-    return apology("TODO")
+
+    # If user is already logged in redirect him.
+    if session.get("user_id"):
+        return redirect("/")
+
+    if request.method == "GET":
+        return render_template("register.html")
+
+    # Else there is POST method
+    username = request.form.get('username')
+    password = request.form.get('password')
+    confirmation = request.form.get('confirmation')
+    # Check for errors
+    if not all([username, password, confirmation]):
+        return apology("Please fill in all input fields.")
+    if password != confirmation:
+        return apology("Your passwords don't match.")
+    db = get_db()
+    rows = db.execute(
+        "SELECT username FROM users WHERE username = :username",
+        dict(username=username))
+    if rows.fetchall():
+        return apology("Username %s already exists" % username)
+
+    # Add user
+    hashed_password = generate_password_hash(password)
+    db.execute("INSERT INTO users (username, hash) VALUES (?, ?)",
+               [username, hashed_password])
+    db.commit()
+
+    return redirect("/")
 
 
 @app.route("/sell", methods=["GET", "POST"])
 @login_required
 def sell():
     """Sell shares of stock"""
-    return apology("TODO")
+
+    return render_template("sell.html")
 
 
 def errorhandler(e):
