@@ -1,10 +1,10 @@
 from datetime import datetime
 import os
 import sqlite3
-
+from sqlite3 import Row
 
 from flask import (
-    Flask, flash, jsonify, redirect, render_template, request, session, g)
+    Flask, flash, redirect, render_template, request, session, g)
 from flask_session import Session
 from tempfile import mkdtemp
 from werkzeug.exceptions import (
@@ -47,7 +47,7 @@ def get_db():
     db = getattr(g, '_database', None)
     if db is None:
         db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite3.Row
+        db.row_factory = Row
     return db
 
 
@@ -68,9 +68,7 @@ if not os.environ.get("API_KEY"):
 def index():
     """Show portfolio of stocks"""
     db = get_db()
-    owned_shares = db.execute(
-        "SELECT symbol, shares FROM shares WHERE user_id = ?",
-        [session["user_id"]]).fetchall()
+    owned_shares = get_user_shares(session["user_id"])
     cash = db.execute("SELECT cash FROM users WHERE id = ?",
                       [session["user_id"]]).fetchone()["cash"]
     assets = cash
@@ -88,6 +86,35 @@ def index():
         "index.html", shares=shares, cash=usd(cash), assets=usd(assets))
 
 
+@app.route("/changepassword", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "GET":
+        return render_template("changePassword.html")
+    current = request.form.get("current")
+    new = request.form.get("new")
+    confirmation = request.form.get("confirmation")
+
+    if not all([current, new, confirmation]):
+        return apology("Fill in all input fields")
+
+    if new != confirmation:
+        return apology("Confirmation password is wrong")
+
+    db = get_db()
+    actual = db.execute("SELECT hash FROM users WHERE id = ?", [
+                        session["user_id"]]).fetchone()['hash']
+    if not check_password_hash(actual, current):
+        return apology("Your passwords don't match", 403)
+
+    hashed_password = generate_password_hash(new)
+    db.execute("UPDATE users SET hash = ? WHERE id = ?",
+               [hashed_password, session["user_id"]])
+    db.commit()
+    flash("Your password has been successfully updated.")
+    return redirect("/login")
+
+
 @app.route("/buy", methods=["GET", "POST"])
 @login_required
 def buy():
@@ -96,61 +123,109 @@ def buy():
         return render_template("buy.html")
 
     symbol = request.form.get("symbol")
-    shares = request.form.get("shares", type=int)
+    shares_count = request.form.get("shares", type=int)
     # Values check
-    if not all([symbol, shares]):
+    if not all([symbol, shares_count]):
         return apology("Fill in all input fields")
-    if shares < 0:
+    if shares_count < 0:
         return apology("Shares must be a positive number")
-    symbol = symbol.upper()
-    stock = lookup(symbol)
-    if not stock:
+    stockinfo = lookup(symbol)
+    if not stockinfo:
         return apology("Invalid symbol")
-    cost = stock["price"] * shares
-    user_id = session["user_id"]
-    db = get_db()
-    user = db.execute("SELECT cash FROM users WHERE id = ?",
-                      [user_id]).fetchone()
+    cost = stockinfo["price"] * shares_count
+    user = get_user_info(session["user_id"])
     cash = user['cash']
     if cash < cost:
         return apology("Unsufficient funds")
 
-    cash_left = cash - cost
+    make_transaction(user, shares_count, stockinfo)
+    flash("Your purchase was successful.")
+    return redirect("/")
 
-    # Take money from user account
+
+def get_user_info(user_id):
+    db = get_db()
+    user = dict(db.execute(
+        "SELECT cash FROM users WHERE id = ?",
+        [user_id]).fetchone())
+    return user
+
+
+def get_user_shares(user_id):
+    db = get_db()
+    shares = db.execute(
+        "SELECT symbol, shares FROM shares WHERE user_id = ?",
+        [session["user_id"]]).fetchall()
+    return shares
+
+
+def make_transaction(user: dict, shares_count: int, stockinfo: dict):
+    """Make transactions in database to buy or sell stocks.
+    If `shares_count` < 0 -> sell stocks.
+    If `shares_count` > 0 -> buy stocks.
+
+    :param user: User info dictionary from db.
+    :type user: dict
+    :param symbol: Stock symbol
+    :type symbol: str
+    :param shares_count: Amount of shares to buy/sell.
+    :type shares_count: int
+    :param stockinfo: Current information about stock.
+    :type stockinfo: dict
+    :return: returns True if everything is OK.
+    :rtype: bool
+    """
+
+    assert shares_count  # Check if null
+    buying = True if shares_count > 0 else False
+    user_id = session["user_id"]
+    db = get_db()
+    cash = user['cash']
+    cost = stockinfo["price"] * shares_count
+    symbol = stockinfo["symbol"]
+    # If buying
+    balance = cash - cost
+    # Update user money
     db.execute("UPDATE users SET cash = :cash WHERE id = :user_id",
-               dict(cash=cash_left, user_id=user_id))
+               dict(cash=balance, user_id=user_id))
 
     # Find matching share
     share = db.execute(
         "SELECT * FROM shares WHERE user_id = :user_id AND symbol = :symbol",
         dict(user_id=user_id, symbol=symbol)).fetchone()
-    # If user have no related shares then add new row
     if not share:
+        if not buying:
+            raise ValueError("You don't have stocks.")
+        # If buying for the first time
         db.execute("INSERT INTO shares VALUES (?, ?, ?)",
-                   [user_id, symbol, shares])
-    # If user owns company shares update their amount
+                   [user_id, symbol, shares_count])
     else:
-        total_shares = share["shares"] + shares
+        if not buying and share["shares"] < -shares_count:
+            raise ValueError("You don't have enough stocks")
+        total_shares = share["shares"] + shares_count
         db.execute(
             "UPDATE shares SET shares = :shares\
                 WHERE user_id = :user_id AND symbol = :symbol",
             dict(shares=total_shares, user_id=user_id, symbol=symbol))
+
     # Add transaction info
     db.execute(
         "INSERT INTO transactions (user_id, symbol, shares, price, timestamp)\
             VALUES (?, ?, ?, ?, ?)",
-        [user_id, symbol, shares, stock["price"], datetime.now()])
+        [user_id, symbol, shares_count, stockinfo["price"], datetime.now()])
     db.commit()
-    flash("Your purchase was successful.")
-    return redirect("/")
+    return True
 
 
 @app.route("/history")
 @login_required
 def history():
     """Show history of transactions"""
-    return apology("TODO")
+    db = get_db()
+    transactions = db.execute(
+        "SELECT * FROM transactions WHERE user_id = ? ORDER BY timestamp DESC",
+        [session["user_id"]]).fetchall()
+    return render_template("history.html", transactions=transactions)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -261,8 +336,35 @@ def register():
 @login_required
 def sell():
     """Sell shares of stock"""
+    user_id = session["user_id"]
+    db = get_db()
+    if request.method == "GET":
+        shares = map(lambda x: x["symbol"], db.execute(
+            "SELECT symbol FROM shares WHERE user_id = ? AND shares > 0",
+            [user_id]).fetchall())
+        return render_template("sell.html", shares=shares)
 
-    return render_template("sell.html")
+    symbol = request.form.get("symbol")
+    shares_count = request.form.get("shares", type=int)
+    stockinfo = lookup(symbol)
+    if not all([shares_count, symbol]) or shares_count < 0:
+        return apology("Fill in all input fields")
+    if shares_count < 0:
+        return apology("Please enter valid number")
+    if not stockinfo:
+        return apology("Invalid symbol")
+
+    share = db.execute(
+        "SELECT * FROM shares WHERE user_id = ? AND symbol = ?",
+        [user_id, symbol]).fetchone()
+    if not share:
+        return apology("You don't have enough shares")
+    if share["shares"] < shares_count:
+        return apology("You don't have enough shares")
+
+    user = get_user_info(user_id)
+    make_transaction(user, -shares_count, stockinfo)
+    return redirect("/")
 
 
 def errorhandler(e):

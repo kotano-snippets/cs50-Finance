@@ -10,7 +10,7 @@ Buy
     <select class="form-control" name="symbol">
       <option disabled="" selected="" value="">Symbol</option>
       {% for share in shares %}
-        <option value=>{{ share.name }}</option>
+        <option value="{{ share }}">{{ share }}</option>
       {% endfor %}
     </select>
   </div>
